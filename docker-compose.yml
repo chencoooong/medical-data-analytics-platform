@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: medical-db-postgres
+    environment:
+      POSTGRES_DB: medical_analytics
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - medical-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ClickHouse 时间序列数据库
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: medical-db-clickhouse
+    environment:
+      CLICKHOUSE_DB: medical_analytics
+      TZ: Asia/Shanghai
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - medical-network
+
+  # Redis 缓存
+  redis:
+    image: redis:7-alpine
+    container_name: medical-cache-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - medical-network
+    command: redis-server --appendonly yes
+
+  # Kafka 消息队列
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: medical-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks:
+      - medical-network
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: medical-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    networks:
+      - medical-network
+
+  # FastAPI 应用
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medical-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      kafka:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/medical_analytics
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      LOG_LEVEL: INFO
+      TZ: Asia/Shanghai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+    networks:
+      - medical-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medical-celery
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/medical_analytics
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+    networks:
+      - medical-network
+    command: celery -A app.tasks worker --loglevel=info
+
+  # pgAdmin 数据库管理工具
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: medical-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@hospital.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    networks:
+      - medical-network
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  redis_data:
+
+networks:
+  medical-network:
+    driver: bridge
